@@ -12,7 +12,11 @@ typedef struct {
 static CFMutableDictionaryRef liveConnections;
 static int debug;
 static CFStringRef requiredDeviceId;
+
 static char *requiredProcessName;
+static char **ignoredProcesses;
+static unsigned int numIgnoredProcesses = 0;
+
 static void (*printMessage)(int fd, const char *, size_t);
 static void (*printSeparator)(int fd);
 
@@ -32,6 +36,34 @@ static inline void write_string(int fd, const char *string)
     write_fully(fd, string, strlen(string));
 }
 
+static unsigned int num_of_occurrences(const char *string, char toFind)
+{
+    unsigned int count = 0;
+    do {
+        if (*string == toFind) {
+            count++;
+        }
+    } while (*string++ != '\0');
+    return count;
+}
+
+static void parse_ignore_list(char *ignoreList) {
+    int numProcs = num_of_occurrences(ignoreList, ' ') + 1;
+    
+    ignoredProcesses = malloc(sizeof(char *) * numProcs);
+    numIgnoredProcesses = 0;
+    
+    char *token = NULL;
+    while((token = strsep(&ignoreList, " ")) != NULL) {
+        numIgnoredProcesses++;
+        unsigned long tokenLength = strlen(token);
+        char *procName = malloc(sizeof(char) * tokenLength);
+        strncpy(procName, token, tokenLength);
+        
+        ignoredProcesses[numIgnoredProcesses - 1] = procName;
+    }
+}
+
 static int find_space_offsets(const char *buffer, size_t length, size_t *space_offsets_out)
 {
     int o = 0;
@@ -45,6 +77,7 @@ static int find_space_offsets(const char *buffer, size_t length, size_t *space_o
     }
     return o;
 }
+
 static unsigned char should_print_message(const char *buffer, size_t length)
 {
     if (length < 3) return 0; // don't want blank lines
@@ -53,7 +86,7 @@ static unsigned char should_print_message(const char *buffer, size_t length)
     find_space_offsets(buffer, length, space_offsets);
     
     // Check whether process name matches the one passed to -p option and filter if needed
-    if (requiredProcessName != NULL) {
+    if (requiredProcessName != NULL || numIgnoredProcesses > 0) {
         int nameLength = space_offsets[1] - space_offsets[0]; //This size includes the NULL terminator.
         
         char *processName = malloc(nameLength);
@@ -64,9 +97,20 @@ static unsigned char should_print_message(const char *buffer, size_t length)
             if (processName[i] == '[')
                 processName[i] = '\0';
         
-        if (strcmp(processName, requiredProcessName) != 0){
-            free(processName);
-            return 0;
+        
+        if (requiredProcessName != NULL) {
+            if (strcmp(processName, requiredProcessName) != 0) {
+                free(processName);
+                return 0;
+            }
+        }
+        else {
+            for (unsigned int i = 0; i < numIgnoredProcesses; i++) {
+                char *ignoredProcess = ignoredProcesses[i];
+                if (strcmp(processName, ignoredProcess) == 0) {
+                    return 0;
+                }
+            }
         }
         free(processName);
     }
@@ -282,44 +326,60 @@ static void color_separator(int fd)
 int main (int argc, char * const argv[])
 {
     if ((argc == 2) && (strcmp(argv[1], "--help") == 0)) {
-        fprintf(stderr, "Usage: %s [options]\nOptions:\n -d\t\t\tInclude connect/disconnect messages in standard out\n -u <udid>\t\tShow only logs from a specific device\n -p <process name>\tShow only logs from a specific process\n\nControl-C to disconnect\nMail bug reports and suggestions to <ryan.petrich@medialets.com>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [options]\nOptions:\n -d\t\t\tInclude connect/disconnect messages in standard out\n -u <udid>\t\tShow only logs from a specific device\n -p <process name>\tShow only logs from a specific process\n\n -v <process name>\tIgnore logs from any process in a space separated list.\n\nControl-C to disconnect\nMail bug reports and suggestions to <ryan.petrich@medialets.com>\n", argv[0]);
         return 1;
     }
     int c;
     bool use_separators = false;
     bool force_color = false;
 
-    while ((c = getopt(argc, argv, "dcsu:p:")) != -1)
+    while ((c = getopt(argc, argv, "dcsu:p:v:")) != -1)
         switch (c)
     {
         case 'd':
             debug = 1;
             break;
-        case 'c':
+        case 'c': {
             force_color = true;
             break;
-        case 's':
+        }
+        case 's': {
             use_separators = true;
             break;
-        case 'u':
+        }
+        case 'u': {
             if (requiredDeviceId)
                 CFRelease(requiredDeviceId);
             requiredDeviceId = CFStringCreateWithCString(kCFAllocatorDefault, optarg, kCFStringEncodingASCII);
             break;
-        case 'p':
+        }
+        case 'p': {
             requiredProcessName = malloc(strlen(optarg) + 1);
             requiredProcessName[strlen(optarg)] = '\0';
-
+            
             strcpy(requiredProcessName, optarg);
             break;
-        case '?':
-            if (optopt == 'u')
+        }
+        case 'v': {
+            unsigned long optArgLen = strlen(optarg);
+            char *ignoredProcessesString = malloc(optArgLen);
+            memset(ignoredProcessesString, '\0', sizeof('\0'));
+            strncpy(ignoredProcessesString, optarg, optArgLen);
+            
+            parse_ignore_list(ignoredProcessesString);
+            
+            free(ignoredProcessesString);
+            break;
+        }
+        case '?': {
+            if (optopt == 'u' || optopt == 'v')
                 fprintf(stderr, "Option -%c requires an argument.\n", optopt);
             else if (isprint(optopt))
                 fprintf(stderr, "Unknown option `-%c'.\n", optopt);
             else
                 fprintf(stderr, "Unknown option character `\\x%x'.\n", optopt);
             return 1;
+        }
         default:
             abort();
     }
@@ -330,6 +390,7 @@ int main (int argc, char * const argv[])
         printMessage = &write_fully;
         printSeparator = use_separators ? &plain_separator : &no_separator;
     }
+
     liveConnections = CFDictionaryCreateMutable(kCFAllocatorDefault, 0, NULL, NULL);
     am_device_notification *notification;
     AMDeviceNotificationSubscribe(DeviceNotificationCallback, 0, 0, NULL, &notification);
